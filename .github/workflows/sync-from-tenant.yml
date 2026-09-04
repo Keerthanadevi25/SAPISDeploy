@@ -1,0 +1,243 @@
+name: Sync Integration Suite Package to Git
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE_NAME: "Demo_Package"
+  IFLOW_NAME: "Demo_iflow"   # <-- the single iFlow this repo tracks
+
+  GIT_AUTHOR_NAME: "Keerthanadevi Natarajan"
+  GIT_AUTHOR_EMAIL: "keerthanadevi.natarajan@distrelec.com"
+
+  TARGET_BRANCH: "main"
+  SYNC_DIR: "integration-suite-content"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Get OAuth token
+        id: token
+        env:
+          TOKEN_URL: ${{ secrets.DEV_TOKEN_URL }}
+          CLIENT_ID: ${{ secrets.DEV_CLIENT_ID }}
+          CLIENT_SECRET_B64: ${{ secrets.DEV_CLIENT_SECRET_B64 }}
+        run: |
+          set -euo pipefail
+
+          CLIENT_SECRET="$(printf '%s' "$CLIENT_SECRET_B64" | base64 --decode)"
+
+          RESPONSE="$(curl --fail-with-body --silent --show-error \
+            --request POST \
+            "${TOKEN_URL}?grant_type=client_credentials" \
+            --user "${CLIENT_ID}:${CLIENT_SECRET}" \
+            --header "Accept: application/json")"
+
+          ACCESS_TOKEN="$(printf '%s' "$RESPONSE" | jq -r '.access_token // empty')"
+
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "Failed to obtain OAuth token."
+            exit 1
+          fi
+
+          echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Download package and iFlow
+        env:
+          IS_URL: ${{ secrets.DEV_HOST }}
+          ACCESS_TOKEN: ${{ steps.token.outputs.ACCESS_TOKEN }}
+          PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
+          IFLOW_NAME: ${{ env.IFLOW_NAME }}
+          SYNC_DIR: ${{ env.SYNC_DIR }}
+        run: |
+          set -euo pipefail
+
+          IS_URL="${IS_URL%/}"
+
+          mkdir -p "$SYNC_DIR"
+
+          api_get() {
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer $ACCESS_TOKEN" \
+              --header "Accept: application/json" \
+              "$1"
+          }
+
+          echo "Finding package..."
+
+          LIST_PKGS_RESPONSE="$(api_get "$IS_URL/api/v1/IntegrationPackages")"
+
+          PKG_ID="$(printf '%s' "$LIST_PKGS_RESPONSE" | jq -r \
+            --arg name "$PACKAGE_NAME" '
+              .d.results[]
+              | select(.Name==$name)
+              | .Id
+            ' | head -n1)"
+
+          if [ -z "$PKG_ID" ] || [ "$PKG_ID" = "null" ]; then
+            echo "Package not found: $PACKAGE_NAME"
+            exit 1
+          fi
+
+          echo "Package ID: $PKG_ID"
+
+          PKG_RESPONSE="$(api_get "$IS_URL/api/v1/IntegrationPackages('$PKG_ID')")"
+
+          printf '%s' "$PKG_RESPONSE" | jq . \
+            > "$SYNC_DIR/${PACKAGE_NAME}-package.json"
+
+          echo "Finding iFlow: $IFLOW_NAME"
+
+          IFLOWS_RESPONSE="$(api_get \
+            "$IS_URL/api/v1/IntegrationPackages('$PKG_ID')/IntegrationDesigntimeArtifacts")"
+
+          printf '%s' "$IFLOWS_RESPONSE" | jq . \
+            > "$SYNC_DIR/${PACKAGE_NAME}-iflows-list.json"
+
+          ARTIFACT_ID="$(printf '%s' "$IFLOWS_RESPONSE" | jq -r \
+            --arg name "$IFLOW_NAME" '
+              .d.results[]
+              | select(.Name==$name)
+              | .Id
+            ' | head -n1)"
+
+          ARTIFACT_VERSION="$(printf '%s' "$IFLOWS_RESPONSE" | jq -r \
+            --arg name "$IFLOW_NAME" '
+              .d.results[]
+              | select(.Name==$name)
+              | .Version
+            ' | head -n1)"
+
+          if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "null" ]; then
+            echo "iFlow not found in package: $IFLOW_NAME"
+            exit 1
+          fi
+
+          echo "Artifact ID: $ARTIFACT_ID"
+          echo "Version: $ARTIFACT_VERSION"
+
+          IFLOW_DIR="$SYNC_DIR/$PACKAGE_NAME/$IFLOW_NAME"
+          mkdir -p "$IFLOW_DIR"
+
+          printf '%s' "$IFLOWS_RESPONSE" | jq \
+            --arg name "$IFLOW_NAME" '.d.results[] | select(.Name==$name)' \
+            > "$IFLOW_DIR/${IFLOW_NAME}.json"
+
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --header "Authorization: Bearer $ACCESS_TOKEN" \
+            --output "$IFLOW_DIR/${IFLOW_NAME}.zip" \
+            "$IS_URL/api/v1/IntegrationDesigntimeArtifacts(Id='$ARTIFACT_ID',Version='$ARTIFACT_VERSION')/\$value"
+
+          if [ ! -f "$IFLOW_DIR/${IFLOW_NAME}.zip" ]; then
+            echo "ZIP download failed for $IFLOW_NAME"
+            exit 1
+          fi
+
+      - name: Extract iFlow to repo root
+        env:
+          PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
+          IFLOW_NAME: ${{ env.IFLOW_NAME }}
+          SYNC_DIR: ${{ env.SYNC_DIR }}
+        run: |
+          set -euo pipefail
+
+          ZIP="$SYNC_DIR/$PACKAGE_NAME/$IFLOW_NAME/${IFLOW_NAME}.zip"
+
+          # Clear previously tracked iFlow content at repo root before re-extracting,
+          # so files deleted on the tenant are reflected here too.
+          # Only touch known iFlow project paths — never .git/.github/.pipeline.
+          rm -rf META-INF src .project metainfo.prop parameters.prop parameters-config.json
+
+          unzip -o "$ZIP" -d .
+
+          echo "Extracted $IFLOW_NAME to repo root:"
+          find . -maxdepth 2 -not -path './.git*' -not -path './.github*' \
+            -not -path './.pipeline*' -not -path "./${SYNC_DIR}*"
+
+      - name: Normalize exported files
+        run: |
+          set -euo pipefail
+
+          for FILE in metainfo.prop parameters.prop; do
+            if [ -f "$FILE" ]; then
+              sed -i '/^#.*UTC/d' "$FILE"
+            fi
+          done
+
+          echo "Timestamp normalization completed."
+
+      - name: Create deployable iFlow ZIP
+        env:
+          IFLOW_NAME: ${{ env.IFLOW_NAME }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p build
+
+          zip -r "build/${IFLOW_NAME}.zip" \
+            META-INF src .project metainfo.prop parameters.prop \
+            -x '*.git*' 2>/dev/null || true
+
+          unzip -l "build/${IFLOW_NAME}.zip"
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IFLOW_NAME }}-zip
+          path: build/${{ env.IFLOW_NAME }}.zip
+
+      - name: Configure Git with PAT
+        env:
+          GIT_PAT: ${{ secrets.GIT_PAT }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "${{ env.GIT_AUTHOR_NAME }}"
+          git config user.email "${{ env.GIT_AUTHOR_EMAIL }}"
+
+          git remote set-url origin \
+            "https://x-access-token:${GIT_PAT}@github.com/${{ github.repository }}.git"
+
+      - name: Show changed files
+        run: |
+          git status --short
+
+      - name: Commit and push changes
+        run: |
+          set -euo pipefail
+
+          SIGNIFICANT_CHANGES=$(git status --porcelain -- \
+            META-INF src .project metainfo.prop parameters.prop || true)
+
+          if [ -z "$SIGNIFICANT_CHANGES" ]; then
+            echo "No iFlow source changes detected."
+            exit 0
+          fi
+
+          git add -A
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: sync iFlow from Integration Suite"
+          git push origin HEAD:${{ env.TARGET_BRANCH }}
